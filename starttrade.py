@@ -15,7 +15,9 @@ from datetime import timedelta
 import os
 # 8005667636
 
-stocksToCheck = ["PLTU", "KIM", "TSLL", "BRKU", "JPM"]
+# tmr
+stocksToCheck = ["TSLL", "DJT", "PLTU", "SMCL","NVDL"]
+
 # stocksToCheck = ["DJT", "TSLL", "NVDL", "ORCL"]
 # stocksToCheck = ["DJT", "ARB", "PLTR", "NVDL"]
 # stocksToCheck = ["MELI", "DJT", "TSLL", "CNEY", "VCIG"]
@@ -24,7 +26,7 @@ stocksToCheck = ["PLTU", "KIM", "TSLL", "BRKU", "JPM"]
 global amount_to_buy, max_value, factor
 amount_to_buy=7000  # Buy 1 unit per trade
 max_value = 0 
-factor = 2.5
+factor = 1.5
 
 scaleFactor = ctypes.windll.shcore.GetScaleFactorForDevice(0) / 100
 REFRESH_INTERVAL = 120  # 2 minutes in seconds
@@ -214,15 +216,19 @@ def should_make_trade(tv_data, chase_data, stock_symbol, max_value):
         print(f"{stock_symbol} trade skipped: Low trading volume (volume = {volume})")
         return False
 
-    # Condition 3: Recommendation check
-    if recommendation in ["SELL", "STRONG_SELL", "NEUTRAL"]:
+    # Condition 3: Recommendation check not accurate but for lon yes
+    # if recommendation in ["SELL", "STRONG_SELL", "NEUTRAL", "BUY"]: 
     # if recommendation in ["SELL", "STRONG_SELL", "NEUTRAL"]:
-        print(f"{stock_symbol} trade skipped: Recommendation not favorable (recommendation = {recommendation})")
-        return False
+    #     print(f"{stock_symbol} trade skipped: Recommendation not favorable (recommendation = {recommendation})")
+    #     return False
 
     # Condition 4: Price condition
-    if price_condition / last_trade < 1.001:
-        print(f"{stock_symbol} trade skipped: (high*3/5 + low*2/5)/last trade < 1.001 (value = {price_condition / last_trade})")
+    if price_condition / last_trade < 1.002:
+        print(f"{stock_symbol} trade skipped: (high*3/5 + low*2/5)/last trade < 1.002(value = {price_condition / last_trade})")
+        return False
+    print(high, low, last_trade, stock_symbol)
+    if low < last_trade:
+        print(f"{high, low, last_trade, stock_symbol} trade skipped: (low < lastrade (value = {price_condition / last_trade})")
         return False
 
     # Condition 5: Signal threshold
