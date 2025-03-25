@@ -5,30 +5,29 @@ from chase import session
 from chase import symbols as sym
 from screeninfo import get_monitors
 import ctypes
-import yfinance as yf
-import pytz
 import time
 from datetime import datetime
+import pytz
+import talib as ta
 import json
 import pandas as pd
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from realtime import TVfetch_technical_analysis
 from datetime import timedelta
 import os
-import threading
-from ross import detect_buy_limit_points, fetch_latest_data
-
+import yfinance as yf
+from criteria import globalStocks
 # 8005667636
 
 # tmr
-stocksToCheck = symbol = ['NIO', 'BABA', 'NFLY', 'YMAG', 'XOMO', 'AMDY', 'SPXL', 'AMZY', 'GOOY', 'TQQQ']
-
+stocksToCheck = globalStocks
+print("here",stocksToCheck)
 # stocksToCheck = ["DJT", "TSLL", "NVDL", "ORCL"]
 # stocksToCheck = ["DJT", "ARB", "PLTR", "NVDL"]
 # stocksToCheck = ["MELI", "DJT", "TSLL", "CNEY", "VCIG"]
 # stocksToCheck = ["PLTR"]
 # 長記性stocksToCheck = ["CRKN", "WCT", "XCUR", "SBFM", "MTEM", "ADN", "JTAI"]
-global amount_to_buy, max_value, factor, buylimpoint
+global amount_to_buy, max_value, factor
 amount_to_buy=10000  # Buy 1 unit per trade
 max_value = 0 
 factor = 1.5
@@ -39,6 +38,78 @@ last_refresh_time = time.time()
 MARKET_CLOSE_TIME = datetime.now().replace(hour=16, minute=0, second=0, microsecond=0)
 SELL_WINDOW = timedelta(minutes=15)
 
+
+### **1️⃣ Fetch Stock Data**
+def fetch_latest_data():
+    """Fetch the latest stock data for given symbols."""
+    print("🔄 Fetching stock data from Yahoo Finance...")
+    try:
+        data = yf.download(symbols, period='1d', interval='1m')
+    except Exception as e:
+        print(f"❌ Error fetching data: {e}")
+        return pd.DataFrame()
+
+    if data.empty:
+        print("❌ No data returned from Yahoo Finance.")
+        return pd.DataFrame()
+
+    print(f"✅ Data Fetched:\n{data.tail(5)}")
+
+    # ✅ Convert MultiIndex to normal DataFrame
+    if isinstance(data.columns, pd.MultiIndex):
+        data = data.stack(level=1, future_stack=True).rename_axis(['Datetime', 'Symbol']).reset_index()
+
+    # ✅ Ensure Datetime column is in Eastern Time
+    if "Datetime" in data.columns:
+        data["Datetime"] = pd.to_datetime(data["Datetime"]).dt.tz_convert(pytz.timezone("US/Eastern"))
+
+    return data
+
+### **2️⃣ Detect Buy Signals**
+def detect_buy_limit_points(data):
+    """Identify buy signals based on strategy."""
+    if data.empty:
+        print("❌ No data available for buy signal detection.")
+        return pd.DataFrame()
+
+    # ✅ Compute Moving Averages
+    data['EMA_9'] = data.groupby('Symbol')['Close'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
+    data['EMA_21'] = data.groupby('Symbol')['Close'].transform(lambda x: x.ewm(span=21, adjust=False).mean())
+
+    # ✅ VWAP Calculation
+    data['VWAP'] = data.groupby('Symbol', group_keys=False).apply(
+        lambda x: (x['Volume'] * x['Close']).cumsum() / x['Volume'].cumsum()
+    )
+
+    # ✅ Compute Relative Volume (RVOL)
+    data['Volume_SMA_50'] = data.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(window=50).mean())
+    data['RVOL'] = data['Volume'] / data['Volume_SMA_50']
+    data['High_RVOL'] = data['RVOL'] >= 2  # Must be at least 2x the average volume
+
+    # ✅ Detect Candlestick Patterns
+    data['Hammer'] = ta.CDLHAMMER(data["Open"], data["High"], data["Low"], data["Close"])
+    data['Engulfing'] = ta.CDLENGULFING(data["Open"], data["High"], data["Low"], data["Close"])
+    data['MorningStar'] = ta.CDLMORNINGSTAR(data["Open"], data["High"], data["Low"], data["Close"])
+
+    # ✅ Identify First Pullback (Bull Flag Formation)
+    data['Bull_Flag'] = (data['Close'].shift(1) > data['Close']) & (data['Close'] > data['EMA_9'])
+
+    # ✅ Confirm EMA & VWAP Support
+    data['EMA_Support'] = (data['Close'] > data['EMA_9']) & (data['Close'] > data['EMA_21'])
+    data['VWAP_Support'] = data['Close'] > data['VWAP']
+
+    # ✅ Identify Buy Signal
+    data['Buy_Signal'] = data['Bull_Flag'] & data['EMA_Support'] & data['VWAP_Support'] & data['High_RVOL']
+
+    buy_signals = data[data['Buy_Signal']]
+    
+    if buy_signals.empty:
+        print("❌ No buy signals detected.")
+    else:
+        print(f"✅ Buy signals detected:\n{buy_signals[['Symbol', 'Close', 'VWAP', 'EMA_9', 'EMA_21']].head(5)}")
+
+    return buy_signals
+
 # get current screen resolution
 def get_screen_resolution():
     monitor = get_monitors()[0]  # Get the first monitor (primary screen)
@@ -46,32 +117,17 @@ def get_screen_resolution():
     return monitor.width, monitor.height
 
 # Check if the current time is within market hours (9:30 AM to 5:00 PM)
-def is_market_open():
-    now = datetime.now()
-    market_open = now.replace(hour=9, minute=00, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    # return market_open <= now <= market_close
-    return True
+# def is_market_open():
+#     now = datetime.now()
+#     market_open = now.replace(hour=9, minute=00, second=0, microsecond=0)
+#     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+#     # return market_open <= now <= market_close
+#     return True
     
-if not is_market_open():
-    print("Market is closed. Waiting for market hours... term will be ending")
-    sys.exit()
-
-
-def update_buy_limit_points():
-    """Fetch data and detect buy limit points in a separate thread."""
-    global buy_limit_data
-    buy_limit_data = None
-    while True:
-        print("\n🔍 Fetching latest stock data...")
-        data = fetch_latest_data()
-        buy_limit_data = detect_buy_limit_points(data)
-
-        buy_limit_points = buy_limit_data[buy_limit_data['Buy_Signal'] == 1].groupby("Symbol")["Close"].min().reset_index()
-        buy_limit_points.rename(columns={"Close": "Limit Buy Point"}, inplace=True)
-
-buy_limit_thread = threading.Thread(target=update_buy_limit_points, daemon=True)
-buy_limit_thread.start()
+# if not is_market_open():
+#     print("Market is closed. Waiting for market hours... term will be ending")
+#     sys.exit()
+    
 # Get screen resolution
 screen_width, screen_height = get_screen_resolution()
 
@@ -201,20 +257,57 @@ def CHASEfetch_real_time_quote(stock, retry_attempts=2, delay_between_retries=5)
     print(f"Failed to fetch data for {stock} after {retry_attempts} attempts.")
     return None  # Return None to indicate failure
 
+import time
+from datetime import datetime, timedelta
+
+# Global Variables
+last_data_fetch_time = datetime.min  # Store last fetch timestamp
+buy_limit_points = None  # Store buy limit points globally
+
+def fetch_buy_limit_points():
+    """Fetch buy limit points every hour to avoid unnecessary recalculations."""
+    global last_data_fetch_time, buy_limit_points
+
+    now = datetime.now()
+    if (now - last_data_fetch_time) >= timedelta(hours=1):
+        print("⏳ Fetching fresh buy limit points...")
+        data = fetch_latest_data()
+        buy_limit_data = detect_buy_limit_points(data)
+
+        if buy_limit_data.empty:
+            print("⚠️ No valid buy limit points detected.")
+            buy_limit_points = None
+        else:
+            buy_limit_points = buy_limit_data.groupby("Symbol")["Close"].min().reset_index()
+            buy_limit_points.rename(columns={"Close": "Limit Buy Point"}, inplace=True)
+            print("✅ Buy Limit Points Updated!")
+
+        last_data_fetch_time = now  # Update timestamp
+    else:
+        print("🕒 Using cached buy limit points.")
+
 def should_make_trade(tv_data, chase_data, stock_symbol, max_value):
-    """
-    Determines if a trade should be made based on the provided Chase and TradingView data.
+    """Check if trade should be executed with cached buy limit points."""
+    global buy_limit_points
+
+    # Ensure we have the latest buy limit points
+    fetch_buy_limit_points()
+    last_trade = chase_data['last_trade_price']
     
-    Args:
-        chase_data (dict): A dictionary containing the real-time stock data from Chase.
-        tv_data (dict): A dictionary containing the technical analysis data from TradingView.
-        stock_symbol (str): The stock symbol to check the wallet balance for.
-        max_value (float): The maximum available value for trading.
+    # Find limit price for the stock
+    if buy_limit_points is not None:
+        stock_limit_row = buy_limit_points[buy_limit_points["Symbol"] == stock_symbol]
+        if not stock_limit_row.empty:
+            limit_price = stock_limit_row["Limit Buy Point"].values[0]
+            print(f"🟢 {stock_symbol}: Last Trade: {last_trade}, Buy Limit: {limit_price}")
 
-    Returns:
-        bool: True if all trade conditions are met, False otherwise.
-    """
+            if last_trade > limit_price:
+                print(f"❌ {stock_symbol} trade skipped: Last trade price ({last_trade}) is ABOVE buy limit ({limit_price}).")
+                return False
 
+    print(f"✅ Trade conditions met for {stock_symbol}. Proceeding with trade.")
+
+    
     wallet_balance = wallets.get(stock_symbol, 0)
     print(f"Wallet balance for {stock_symbol}: {wallet_balance}")
 
@@ -261,7 +354,6 @@ def should_make_trade(tv_data, chase_data, stock_symbol, max_value):
     # All conditions met
     print(f"Trade conditions met for {stock_symbol}. Proceeding with trade.")
     return True
-
 
 wallets = {symbol: max_value/len(stocksToCheck) for symbol in stocksToCheck}
 print(wallets)
@@ -485,12 +577,6 @@ def sell_all_positions(account_ids, all_accounts, order):
 
 # Main loop to fetch data during market hours and execute trades
 while True:
-    # Check if market is open
-    if not is_market_open():
-        print("Market is closed. Exiting.")
-        sell_all_positions(account_ids, all_accounts, order)
-        sys.exit()
-
     # current_time = datetime.now()
     # if MARKET_CLOSE_TIME - current_time <= SELL_WINDOW:
     #     # Execute sell all if within the window before close
@@ -502,18 +588,30 @@ while True:
     current_time = time.time()
     if current_time - last_refresh_time > REFRESH_INTERVAL:
         print("Refreshing data due to timeout...")
+        # Refresh logic or reload session/page
         
         tempStockToCheck = ["TSLL"]
         CHASEfetch_real_time_quote(tempStockToCheck)
 
         last_refresh_time = current_time  # Reset the last refresh time after refreshing
 
-    for stock in stocksToCheck:        
-        if max_value > 3000 and should_make_trade(stock, max_value):
+    # Fetch technical analysis data
+    TV_data = TVfetch_technical_analysis(stocksToCheck)
+    
+    for stock in stocksToCheck:
+        if stock not in TV_data.index:
+            print(f"{stock} not found in TV_data.")
+            continue 
+        tv_data = TV_data.loc[stock]
+
+        # Check if a buy trade should be made
+        chase_data = CHASEfetch_real_time_quote(stock)
+        
+        if max_value > 3000 and chase_data and should_make_trade(tv_data, chase_data, stock, max_value):
             last_refresh_time = time.time()
             print("Trade made, refresh timer reset.")
             # Place the trade
-            make_trade(order, stock, account_ids)
+            make_trade(order, stock, chase_data, tv_data, account_ids)
 
     # Sleep for a short period before checking again
     time.sleep(5)

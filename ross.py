@@ -1,44 +1,56 @@
 import yfinance as yf
-import matplotlib.pyplot as plt
 import pandas as pd
 import talib as ta
 import pytz
-import numpy as np
 import time
+import threading
 
-# Set timezone to Eastern Time (New York)
+# ✅ Set timezone to Eastern Time (New York)
 eastern_tz = pytz.timezone("US/Eastern")
 
-# Define stock symbols
-symbols = ['NIO', 'BABA', 'YMAG', 'TSLY', 'NVDY', 'SPXL', 'TQQQ', 'PLTR', 'CONY']
+# ✅ Define stock symbols
+
+
+from criteria import globalStocks
+# 8005667636
+
+# tmr
+symbols = globalStocks
+# ✅ Global variables for tracking entries and exits
+buy_limit_data = pd.DataFrame()
+tracked_positions = pd.DataFrame(columns=["Symbol", "Entry_Price", "Quantity"])
+
+### **1️⃣ Fetch Stock Data**
 def fetch_latest_data():
     """Fetch the latest stock data for given symbols."""
-    data = yf.download(symbols, period='1d', interval='1m')
-    # ✅ Remove failed downloads (possibly delisted stocks)
-    failed_stocks = [s for s in symbols if s not in data.columns.get_level_values(0)]
-    if failed_stocks:
-        print(f"⚠️ Failed downloads: {failed_stocks} (Possibly delisted or no price data available)")
+    print("🔄 Fetching stock data from Yahoo Finance...")
+    try:
+        data = yf.download(symbols, period='1d', interval='1m', prepost=True)  
+    except Exception as e:
+        print(f"❌ Error fetching data: {e}")
+        return pd.DataFrame()
 
-    # ✅ Convert to Eastern Time
+    if data.empty:
+        print("❌ No data returned from Yahoo Finance.")
+        return pd.DataFrame()
+
+    print(f"✅ Data Fetched:\n{data.tail(5)}")
+
+    # ✅ Convert MultiIndex to normal DataFrame
     if isinstance(data.columns, pd.MultiIndex):
-        data = data.stack(level=1).rename_axis(['Datetime', 'Symbol']).reset_index()
+        data = data.stack(level=1, future_stack=True).rename_axis(['Datetime', 'Symbol']).reset_index()
 
-    # ✅ Ensure "Datetime" column is properly formatted
+    # ✅ Ensure Datetime column is in Eastern Time
     if "Datetime" in data.columns:
         data["Datetime"] = pd.to_datetime(data["Datetime"]).dt.tz_convert(eastern_tz)
-
     return data
 
+### **2️⃣ Detect Buy Signals**
 def detect_buy_limit_points(data):
-    """Identify the best buy limit points based on momentum strategy."""
-    # ✅ Flatten MultiIndex DataFrame from yfinance
-    if isinstance(data.columns, pd.MultiIndex):
-        data = data.stack(level=1).rename_axis(['Datetime', 'Symbol']).reset_index()
-
-    # ✅ Ensure required columns exist
-    required_cols = {'Open', 'High', 'Low', 'Close', 'Volume'}
-    if not required_cols.issubset(data.columns):
-        raise ValueError(f"Missing required columns: {required_cols - set(data.columns)}")
+    """Identify buy signals based on strategy."""
+    if data.empty:
+        print("❌ No data available for buy signal detection.")
+        return pd.DataFrame()
 
     # ✅ Compute Moving Averages
     data['EMA_9'] = data.groupby('Symbol')['Close'].transform(lambda x: x.ewm(span=9, adjust=False).mean())
@@ -59,10 +71,6 @@ def detect_buy_limit_points(data):
     data['Engulfing'] = ta.CDLENGULFING(data["Open"], data["High"], data["Low"], data["Close"])
     data['MorningStar'] = ta.CDLMORNINGSTAR(data["Open"], data["High"], data["Low"], data["Close"])
 
-    # ✅ Filter for the first trading hour (9:30 AM - 11:30 AM ET)
-    # data = data[(data['Datetime'].dt.time >= pd.to_datetime("09:30:00").time()) &
-    #             (data['Datetime'].dt.time <= pd.to_datetime("11:30:00").time())]
-
     # ✅ Identify First Pullback (Bull Flag Formation)
     data['Bull_Flag'] = (data['Close'].shift(1) > data['Close']) & (data['Close'] > data['EMA_9'])
 
@@ -73,40 +81,101 @@ def detect_buy_limit_points(data):
     # ✅ Identify Buy Signal
     data['Buy_Signal'] = data['Bull_Flag'] & data['EMA_Support'] & data['VWAP_Support'] & data['High_RVOL']
 
-    return data[data['Buy_Signal']]
+    buy_signals = data[data['Buy_Signal']]
+    
+    if buy_signals.empty:
+        print("❌ No buy signals detected.")
+    else:
+        print(f"✅ Buy signals detected:\n{buy_signals[['Symbol', 'Close', 'VWAP', 'EMA_9', 'EMA_21']].head(5)}")
 
-def monitor_stock(symbol):
-    """Continuously monitor stock data and detect buy limit points."""
+    return buy_signals
+
+### **3️⃣ Detect Exit Signals**
+def detect_exit_indicators(data):
+    """Find exit indicators for tracked positions."""
+    global tracked_positions
+
+    if tracked_positions.empty:
+        print("❌ No active trades to monitor.")
+        return []
+
+    exit_signals = []
+    for _, position in tracked_positions.iterrows():
+        symbol = position["Symbol"]
+        entry_price = position["Entry_Price"]
+
+        symbol_data = data[data["Symbol"] == symbol]
+        if symbol_data.empty:
+            print(f"⚠️ No data for {symbol}. Skipping exit check.")
+            continue
+
+        latest_price = symbol_data.iloc[-1]["Close"]
+        print(f"🔍 Checking {symbol} | Entry: {entry_price:.2f} | Current: {latest_price:.2f}")
+
+        first_red_candle = symbol_data.iloc[-1]["Close"] < symbol_data.iloc[-2]["Close"]
+        extension_spike = (latest_price - entry_price) >= (entry_price * 0.03)
+
+        # ✅ Exit #1: Take profit at 2% gain
+        if latest_price >= entry_price * 1.02:
+            exit_signals.append((symbol, latest_price, "Take Profit (Sell 1/2)"))
+
+        # ✅ Exit #2: First red candle
+        elif first_red_candle:
+            exit_signals.append((symbol, latest_price, "First Red Candle (Exit All)"))
+
+        # ✅ Exit #3: Extension spike
+        elif extension_spike:
+            exit_signals.append((symbol, latest_price, "Extension Bar (Sell All)"))
+
+    if not exit_signals:
+        print("❌ No exit signals detected.")
+
+    return exit_signals
+
+### **4️⃣ Trading Execution & Monitoring**
+def update_buy_limit_points():
+    """Monitor & execute trades using Ross's Gap & Go strategy."""
     global buy_limit_data
+    global tracked_positions
 
     while True:
-        data = fetch_latest_data(symbol)
-        buy_point = detect_buy_limit_points(data, symbol)
+        print("\n🔍 Fetching latest stock data...")
+        data = fetch_latest_data()
+        if data.empty:
+            print("⚠️ No new data fetched. Retrying...")
+            time.sleep(5)
+            continue
 
-        if buy_point:
-            # Update the global DataFrame
-            buy_limit_data = pd.concat([buy_limit_data, pd.DataFrame([buy_point])]).drop_duplicates(subset=["Symbol"], keep="last")
+        buy_limit_data = detect_buy_limit_points(data)
 
-        # ✅ Print updated buy limit points
-        print("\n📊 Updated Buy Limit Points:")
-        print(buy_limit_data)
+        if not buy_limit_data.empty:
+            buy_limit_points = buy_limit_data.groupby("Symbol")["Close"].min().reset_index()
+            buy_limit_points.rename(columns={"Close": "Limit Buy Point"}, inplace=True)
+            print("\n📊 Best Buy Limit Points Identified:")
+            print(buy_limit_points)
 
-        time.sleep(1)  # Run every second
+            # ✅ Execute trades
+            for _, row in buy_limit_points.iterrows():
+                symbol = row["Symbol"]
+                if symbol not in tracked_positions["Symbol"].values:
+                    tracked_positions = pd.concat([
+                        tracked_positions,
+                        pd.DataFrame([[symbol, row["Limit Buy Point"], 1]], columns=["Symbol", "Entry_Price", "Quantity"])
+                    ], ignore_index=True)
 
-# ✅ Fetch & Process Data
-print("\n🔍 Fetching latest data...")
-data = fetch_latest_data()
+        # ✅ Detect Exit Indicators
+        exit_signals = detect_exit_indicators(data)
+        if exit_signals:
+            print("\n🚨 Exit Indicators Detected:")
+            for exit_signal in exit_signals:
+                print(f"🔴 {exit_signal[0]} | Price: {exit_signal[1]:.2f} | Signal: {exit_signal[2]}")
 
-# ✅ Detect Buy Limit Points
-buy_limit_data = detect_buy_limit_points(data)
+        time.sleep(5)  # ✅ Fetch data every 5 seconds
 
-buy_limit_points = buy_limit_data[buy_limit_data['Buy_Signal'] == 1].groupby("Symbol")["Close"].min().reset_index()
-buy_limit_points.rename(columns={"Close": "Limit Buy Point"}, inplace=True)
+# ✅ Start Trading Thread
+buy_limit_thread = threading.Thread(target=update_buy_limit_points, daemon=True)
+buy_limit_thread.start()
 
-# ✅ Show Results
-print("\n📊 Best Buy Limit Points Identified:")
-if buy_limit_data.empty:
-    print("❌ No valid buy signals found.")
-else:
-    print(buy_limit_data[['Datetime', 'Symbol', 'Close', 'VWAP', 'EMA_9', 'EMA_21', 'High_RVOL', 'Bull_Flag', 'Buy_Signal']])
-print(buy_limit_points)
+# ✅ Prevent script from exiting
+while True:
+    time.sleep(1)  # Keeps the main thread running
